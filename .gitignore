@@ -1,0 +1,26 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Runtime logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
