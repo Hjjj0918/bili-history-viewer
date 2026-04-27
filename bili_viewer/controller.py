@@ -33,12 +33,31 @@ class AppController:
             self.view.show_error("请先输入 SESSDATA。")
             return
 
+        # 收集选中的数据源
+        source_map = {
+            "动态": self.view.cb_dynamics,
+            "评论": self.view.cb_comments,
+            "收藏": self.view.cb_favorites,
+            "点赞": self.view.cb_likes,
+            "关注": self.view.cb_followings,
+            "粉丝": self.view.cb_followers,
+            "直播间": self.view.cb_live,
+        }
+        enabled_sources = {name for name, cb in source_map.items() if cb.isChecked()}
+        if not enabled_sources:
+            self.view.show_error("请至少选择一个数据源。")
+            return
+
         self.view.set_loading(True, "开始查询...")
         self.records.clear()
         self.view.export_csv_btn.setEnabled(False)
         self.view.export_json_btn.setEnabled(False)
 
-        self.worker = FetchWorker(uid=uid, sessdata=sessdata)
+        self.worker = FetchWorker(
+            uid=uid,
+            sessdata=sessdata,
+            enabled_sources=enabled_sources,
+        )
         self.worker.progress.connect(self.on_worker_progress)
         self.worker.success.connect(self.on_worker_success)
         self.worker.error.connect(self.on_worker_error)

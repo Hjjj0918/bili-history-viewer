@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -59,13 +60,40 @@ class MainWindow(QMainWindow):
         form_layout.addWidget(QLabel("SESSDATA:"), 1, 0)
         form_layout.addWidget(self.sessdata_edit, 1, 1)
 
+        # 数据源选择
+        sources_label = QLabel("数据源:")
+        form_layout.addWidget(sources_label, 2, 0)
+
+        sources_layout = QHBoxLayout()
+        self.cb_dynamics = QCheckBox("空间动态")
+        self.cb_comments = QCheckBox("视频评论")
+        self.cb_favorites = QCheckBox("收藏夹")
+        self.cb_likes = QCheckBox("点赞视频")
+        self.cb_followings = QCheckBox("关注列表")
+        self.cb_followers = QCheckBox("粉丝列表")
+        self.cb_live = QCheckBox("直播间发言")
+
+        self.cb_dynamics.setChecked(True)
+        self.cb_comments.setChecked(True)
+
+        sources_layout.addWidget(self.cb_dynamics)
+        sources_layout.addWidget(self.cb_comments)
+        sources_layout.addWidget(self.cb_favorites)
+        sources_layout.addWidget(self.cb_likes)
+        sources_layout.addWidget(self.cb_followings)
+        sources_layout.addWidget(self.cb_followers)
+        sources_layout.addWidget(self.cb_live)
+        sources_layout.addStretch(1)
+
+        form_layout.addLayout(sources_layout, 2, 1)
+
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.query_btn)
         button_layout.addWidget(self.export_csv_btn)
         button_layout.addWidget(self.export_json_btn)
         button_layout.addStretch(1)
 
-        form_layout.addLayout(button_layout, 2, 0, 1, 2)
+        form_layout.addLayout(button_layout, 3, 0, 1, 2)
 
         # 状态区域
         status_layout = QHBoxLayout()

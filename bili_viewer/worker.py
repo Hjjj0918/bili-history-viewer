@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Set
 
 from PySide6.QtCore import QThread, Signal
 
@@ -19,18 +19,27 @@ class FetchWorker(QThread):
     error = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, uid: str, sessdata: str) -> None:
+    def __init__(
+        self,
+        uid: str,
+        sessdata: str,
+        enabled_sources: Set[str] | None = None,
+    ) -> None:
         super().__init__()
         self.uid = uid.strip()
         self.sessdata = sessdata.strip()
+        self.enabled_sources = enabled_sources or {"动态", "评论"}
 
     def run(self) -> None:
         try:
             self.progress.emit("正在初始化请求客户端...")
             client = BiliClient(sessdata=self.sessdata)
 
-            self.progress.emit("正在抓取数据，请稍候...")
-            records: List[SpeechRecord] = client.fetch_user_speeches(uid=self.uid)
+            records: List[SpeechRecord] = client.fetch_user_speeches(
+                uid=self.uid,
+                enabled_sources=self.enabled_sources,
+                progress_callback=lambda msg: self.progress.emit(msg),
+            )
             self.success.emit(records)
         except InvalidSESSDATAError as exc:
             logger.warning("SESSDATA 校验失败: %s", exc)

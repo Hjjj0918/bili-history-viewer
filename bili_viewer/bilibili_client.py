@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import random
 import time
+import uuid
 from datetime import datetime
 from http.cookies import SimpleCookie
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
 from requests import Response
@@ -15,6 +16,19 @@ from .models import SpeechRecord
 
 
 logger = logging.getLogger(__name__)
+
+
+def _rand_hex(n: int) -> str:
+    """生成 n 位随机十六进制字符串（大写）."""
+    return uuid.uuid4().hex[:n].upper()
+
+
+def _make_buvid3() -> str:
+    return f"{_rand_hex(8)}-{_rand_hex(4)}-{_rand_hex(4)}-{_rand_hex(4)}-{_rand_hex(12)}infoc"
+
+
+def _make_buvid4() -> str:
+    return f"{_rand_hex(8)}-{_rand_hex(4)}-{_rand_hex(4)}-{_rand_hex(4)}-{_rand_hex(12)}"
 
 
 class BiliClientError(Exception):
@@ -32,8 +46,8 @@ class UIDNotFoundError(BiliClientError):
 class BiliClient:
     """B 站请求客户端。
 
-    注意：B 站并未公开“按 UID 全站检索所有评论”的官方接口。
-    本工具采用“空间动态 + 目标用户投稿视频评论区过滤”的方式进行近似检索。
+    注意：B 站并未公开\u201c按 UID 全站检索所有评论\u201d的官方接口。
+    本工具采用\u201c空间动态 + 目标用户投稿视频评论区过滤\u201d的方式进行近似检索。
     """
 
     USER_AGENTS = [
@@ -45,7 +59,7 @@ class BiliClient:
 
     @staticmethod
     def _normalize_sessdata(raw_input: str) -> str:
-        """兼容“仅值”与“整串 Cookie”两种输入，并校验编码安全性。"""
+        """兼容\u201c仅值\u201d与\u201c整串 Cookie\u201d两种输入，并校验编码安全性。"""
         text = (raw_input or "").strip()
         if not text:
             raise InvalidSESSDATAError("SESSDATA 为空，请重新输入。")
@@ -99,14 +113,31 @@ class BiliClient:
                 "Sec-Fetch-Site": "same-site",
             }
         )
+        self._warmup_session()
 
     def _warmup_session(self) -> None:
-        """先访问首页，让服务端下发常见风控相关 Cookie。"""
+        """补充 B站 追踪 Cookie 并访问首页完成会话预热。
+
+        buvid3/buvid4/_uuid 是 B站前端 JS 生成的设备指纹，缺失时极易触发 412。
+        """
+        now = int(time.time())
+        self.session.cookies.set("buvid3", _make_buvid3(), domain=".bilibili.com")
+        self.session.cookies.set("buvid4", _make_buvid4(), domain=".bilibili.com")
+        self.session.cookies.set("b_nut", str(now), domain=".bilibili.com")
+        self.session.cookies.set(
+            "b_lsid",
+            f"{now % 10000}_{_rand_hex(6).lower()}",
+            domain=".bilibili.com",
+        )
+        self.session.cookies.set(
+            "_uuid",
+            f"{_rand_hex(8)}-{_rand_hex(4)}-{_rand_hex(4)}-{_rand_hex(4)}-{_rand_hex(12)}{now % 100000}infoc",
+            domain=".bilibili.com",
+        )
         try:
             self.session.headers["User-Agent"] = random.choice(self.USER_AGENTS)
             self.session.get("https://www.bilibili.com/", timeout=self.timeout)
         except RequestException:
-            # 预热失败不阻断主流程。
             logger.exception("会话预热失败")
             return
 
@@ -199,7 +230,7 @@ class BiliClient:
         return str(cur)
 
     def fetch_user_dynamics(self, uid: str, max_pages: int = 4) -> List[SpeechRecord]:
-        """抓取用户空间动态作为“历史发言”来源之一。"""
+        """抓取用户空间动态作为\u201c历史发言\u201d来源之一。"""
         records: List[SpeechRecord] = []
         offset = ""
 
@@ -342,34 +373,377 @@ class BiliClient:
 
         return records
 
-    def fetch_user_speeches(self, uid: str) -> List[SpeechRecord]:
-        """抓取“历史发言”记录（动态 + 评论）。"""
+    # ------------------------------------------------------------------
+    # 新增数据源
+    # ------------------------------------------------------------------
+
+    def fetch_user_favorites(self, uid: str, max_folder_pages: int = 3) -> List[SpeechRecord]:
+        """抓取用户公开收藏夹内容。"""
+        records: List[SpeechRecord] = []
+
+        # 1) 获取用户创建的收藏夹列表
+        folders: List[Dict[str, Any]] = []
+        for pn in range(1, max_folder_pages + 1):
+            payload = self._request(
+                "https://api.bilibili.com/x/v3/fav/folder/created/list",
+                params={"up_mid": uid, "pn": pn, "ps": 20},
+            )
+            if payload.get("code") != 0:
+                break
+
+            f_list = payload.get("data", {}).get("list", [])
+            if not f_list:
+                break
+            folders.extend(f_list)
+            time.sleep(random.uniform(0.3, 0.6))
+
+        # 2) 在每个收藏夹中拉取内容
+        for folder in folders:
+            fid = folder.get("id") or folder.get("media_id")
+            folder_title = folder.get("title", "未命名收藏夹")
+            if not fid:
+                continue
+
+            for pn in range(1, 4):  # 每个收藏夹最多3页
+                payload = self._request(
+                    "https://api.bilibili.com/x/v3/fav/resource/list",
+                    params={
+                        "media_id": fid,
+                        "pn": pn,
+                        "ps": 20,
+                        "order": "mtime",
+                        "type": 0,
+                        "platform": "web",
+                    },
+                )
+                if payload.get("code") != 0:
+                    break
+
+                medias = payload.get("data", {}).get("medias") or []
+                for m in medias:
+                    title = m.get("title", "")
+                    intro = m.get("intro", "")
+                    ctime = m.get("ctime", 0)
+                    bvid = m.get("bvid", "")
+                    url = f"https://www.bilibili.com/video/{bvid}" if bvid else m.get("link", "")
+
+                    records.append(
+                        SpeechRecord(
+                            source_type="收藏",
+                            content=title + (f" \u2014 {intro}" if intro else ""),
+                            publish_time=self._format_ts(ctime) if ctime else "",
+                            source_title=f"收藏夹: {folder_title}",
+                            source_url=url,
+                        )
+                    )
+
+                if not payload.get("data", {}).get("has_more"):
+                    break
+                time.sleep(random.uniform(0.3, 0.6))
+
+            time.sleep(random.uniform(0.3, 0.6))
+
+        return records
+
+    def fetch_user_liked_videos(self, uid: str, max_pages: int = 3) -> List[SpeechRecord]:
+        """抓取用户公开点赞视频列表。"""
+        records: List[SpeechRecord] = []
+
+        for pn in range(1, max_pages + 1):
+            payload = self._request(
+                "https://api.bilibili.com/x/space/like/video",
+                params={"vmid": uid, "pn": pn, "ps": 20},
+            )
+            if payload.get("code") != 0:
+                break
+
+            v_list = payload.get("data", {}).get("list") or []
+            if not v_list:
+                break
+
+            for v in v_list:
+                title = v.get("title", "")
+                ctime = v.get("ctime", 0)
+                bvid = v.get("bvid", "")
+                url = f"https://www.bilibili.com/video/{bvid}" if bvid else ""
+
+                records.append(
+                    SpeechRecord(
+                        source_type="点赞",
+                        content=title,
+                        publish_time=self._format_ts(ctime) if ctime else "",
+                        source_title="点赞视频",
+                        source_url=url,
+                    )
+                )
+
+            time.sleep(random.uniform(0.3, 0.6))
+
+        return records
+
+    def fetch_user_followings(self, uid: str, max_pages: int = 3) -> List[SpeechRecord]:
+        """抓取用户关注列表。"""
+        records: List[SpeechRecord] = []
+
+        for pn in range(1, max_pages + 1):
+            payload = self._request(
+                "https://api.bilibili.com/x/relation/followings",
+                params={"vmid": uid, "pn": pn, "ps": 50, "order": "desc"},
+            )
+            if payload.get("code") != 0:
+                break
+
+            f_list = payload.get("data", {}).get("list") or []
+            if not f_list:
+                break
+
+            for f in f_list:
+                uname = f.get("uname", "")
+                sign = f.get("sign", "")
+                mtime = f.get("mtime", 0)
+                f_mid = f.get("mid", "")
+                url = f"https://space.bilibili.com/{f_mid}" if f_mid else ""
+
+                records.append(
+                    SpeechRecord(
+                        source_type="关注",
+                        content=uname + (f" \u2014 {sign}" if sign else ""),
+                        publish_time=self._format_ts(mtime) if mtime else "",
+                        source_title="关注列表",
+                        source_url=url,
+                    )
+                )
+
+            time.sleep(random.uniform(0.3, 0.6))
+
+        return records
+
+    def fetch_user_followers(self, uid: str, max_pages: int = 3) -> List[SpeechRecord]:
+        """抓取用户粉丝列表。"""
+        records: List[SpeechRecord] = []
+
+        for pn in range(1, max_pages + 1):
+            payload = self._request(
+                "https://api.bilibili.com/x/relation/followers",
+                params={"vmid": uid, "pn": pn, "ps": 50, "order": "desc"},
+            )
+            if payload.get("code") != 0:
+                break
+
+            f_list = payload.get("data", {}).get("list") or []
+            if not f_list:
+                break
+
+            for f in f_list:
+                uname = f.get("uname", "")
+                sign = f.get("sign", "")
+                mtime = f.get("mtime", 0)
+                f_mid = f.get("mid", "")
+                url = f"https://space.bilibili.com/{f_mid}" if f_mid else ""
+
+                records.append(
+                    SpeechRecord(
+                        source_type="粉丝",
+                        content=uname + (f" \u2014 {sign}" if sign else ""),
+                        publish_time=self._format_ts(mtime) if mtime else "",
+                        source_title="粉丝列表",
+                        source_url=url,
+                    )
+                )
+
+            time.sleep(random.uniform(0.3, 0.6))
+
+        return records
+
+    def fetch_user_live_messages(
+        self, uid: str, max_rooms: int = 5, max_pages: int = 3
+    ) -> List[SpeechRecord]:
+        """抓取用户直播间发言记录。
+
+        策略：
+        1) 检查用户自己是否开过直播间
+        2) 从用户关注列表中找到开播的 up 主
+        3) 在这些直播间拉取弹幕历史并过滤目标 UID
+        """
+        records: List[SpeechRecord] = []
+        room_ids: List[int] = []
+
+        # 1) 检查用户自己的直播间
+        try:
+            payload = self._request(
+                "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld",
+                params={"mid": uid},
+            )
+            if payload.get("code") == 0:
+                data = payload.get("data", {})
+                r_id = data.get("roomid", 0)
+                if r_id:
+                    room_ids.append(int(r_id))
+        except BiliClientError:
+            pass
+
+        # 2) 从关注列表中找直播 up 主的房间号
+        if len(room_ids) < max_rooms:
+            try:
+                followings_payload = self._request(
+                    "https://api.bilibili.com/x/relation/followings",
+                    params={"vmid": uid, "pn": 1, "ps": 20, "order": "desc"},
+                )
+                if followings_payload.get("code") == 0:
+                    for f in followings_payload.get("data", {}).get("list", []):
+                        if len(room_ids) >= max_rooms:
+                            break
+                        f_mid = f.get("mid", "")
+                        if not f_mid:
+                            continue
+                        try:
+                            live_payload = self._request(
+                                "https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld",
+                                params={"mid": f_mid},
+                            )
+                            if live_payload.get("code") == 0:
+                                r_id = live_payload.get("data", {}).get("roomid", 0)
+                                if r_id:
+                                    room_ids.append(int(r_id))
+                        except BiliClientError:
+                            continue
+                        time.sleep(random.uniform(0.2, 0.4))
+            except BiliClientError:
+                pass
+
+        # 3) 从直播间拉取弹幕历史
+        for room_id in room_ids:
+            try:
+                payload = self._request(
+                    "https://api.live.bilibili.com/xlive/web-room/v1/dM/gethistory",
+                    params={"roomid": room_id},
+                )
+                if payload.get("code") == 0:
+                    room_data = payload.get("data", {})
+                    room_msgs = room_data.get("room") or []
+                    for msg in room_msgs:
+                        msg_uid = str(msg.get("uid", ""))
+                        if msg_uid != str(uid):
+                            continue
+                        text = msg.get("text", "")
+                        timeline = msg.get("timeline", "")
+                        nickname = msg.get("nickname", "")
+                        url = f"https://live.bilibili.com/{room_id}" if room_id else ""
+
+                        records.append(
+                            SpeechRecord(
+                                source_type="直播间",
+                                content=text,
+                                publish_time=timeline,
+                                source_title=f"直播间 {room_id}\uff08用户：{nickname}\uff09",
+                                source_url=url,
+                            )
+                        )
+            except BiliClientError:
+                continue
+
+            time.sleep(random.uniform(0.3, 0.6))
+
+        return records
+
+    # ------------------------------------------------------------------
+    # 主抓取调度
+    # ------------------------------------------------------------------
+
+    def fetch_user_speeches(
+        self,
+        uid: str,
+        enabled_sources: Optional[Set[str]] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> List[SpeechRecord]:
+        """抓取用户数据（支持多数据源）。
+
+        参数:
+            uid: 目标用户 UID
+            enabled_sources: 启用的数据源集合，可选值:
+                "动态", "评论", "收藏", "点赞", "关注", "粉丝", "直播间"
+                默认 {"动态", "评论"}
+            progress_callback: 进度回调
+        """
+        if enabled_sources is None:
+            enabled_sources = {"动态", "评论"}
+
+        def emit(msg: str) -> None:
+            if progress_callback:
+                progress_callback(msg)
+
         self.validate_sessdata()
         self.ensure_uid_exists(uid)
 
         all_records: List[SpeechRecord] = []
 
-        # 1) 空间动态
-        all_records.extend(self.fetch_user_dynamics(uid=uid, max_pages=4))
+        # 空间动态
+        if "动态" in enabled_sources:
+            emit("正在抓取空间动态...")
+            all_records.extend(self.fetch_user_dynamics(uid=uid, max_pages=4))
 
-        # 2) 在其投稿视频评论区中筛选该 UID 的评论
-        videos = self.fetch_user_videos(uid=uid, max_pages=2)
-        for video in videos:
-            all_records.extend(
-                self.fetch_comments_by_uid_on_video(
-                    target_uid=uid,
-                    aid=int(video["aid"]),
-                    video_title=video.get("title", ""),
-                    max_pages=2,
+        # 视频评论
+        if "评论" in enabled_sources:
+            emit("正在抓取视频评论...")
+            videos = self.fetch_user_videos(uid=uid, max_pages=2)
+            for video in videos:
+                all_records.extend(
+                    self.fetch_comments_by_uid_on_video(
+                        target_uid=uid,
+                        aid=int(video["aid"]),
+                        video_title=video.get("title", ""),
+                        max_pages=2,
+                    )
                 )
-            )
 
-        # 3) 去重（同一来源 + 同一内容 + 同一时间）
+        # 收藏夹
+        if "收藏" in enabled_sources:
+            emit("正在抓取收藏夹...")
+            try:
+                all_records.extend(self.fetch_user_favorites(uid=uid, max_folder_pages=3))
+            except BiliClientError:
+                logger.exception("收藏夹抓取失败，跳过该数据源")
+
+        # 点赞视频
+        if "点赞" in enabled_sources:
+            emit("正在抓取点赞记录...")
+            try:
+                all_records.extend(self.fetch_user_liked_videos(uid=uid, max_pages=3))
+            except BiliClientError:
+                logger.exception("点赞记录抓取失败，跳过该数据源")
+
+        # 关注列表
+        if "关注" in enabled_sources:
+            emit("正在抓取关注列表...")
+            try:
+                all_records.extend(self.fetch_user_followings(uid=uid, max_pages=3))
+            except BiliClientError:
+                logger.exception("关注列表抓取失败，跳过该数据源")
+
+        # 粉丝列表
+        if "粉丝" in enabled_sources:
+            emit("正在抓取粉丝列表...")
+            try:
+                all_records.extend(self.fetch_user_followers(uid=uid, max_pages=3))
+            except BiliClientError:
+                logger.exception("粉丝列表抓取失败，跳过该数据源")
+
+        # 直播间发言
+        if "直播间" in enabled_sources:
+            emit("正在抓取直播间发言...")
+            try:
+                all_records.extend(
+                    self.fetch_user_live_messages(uid=uid, max_rooms=5, max_pages=3)
+                )
+            except BiliClientError:
+                logger.exception("直播间发言抓取失败，跳过该数据源")
+
+        # 去重
+        emit("正在去重和排序...")
         unique: Dict[str, SpeechRecord] = {}
         for item in all_records:
             key = f"{item.source_type}|{item.publish_time}|{item.source_title}|{item.content}"
             unique[key] = item
 
-        # 默认按时间倒序（字符串时间可直接比较：YYYY-MM-DD HH:MM:SS）
         result = sorted(unique.values(), key=lambda x: x.publish_time, reverse=True)
         return result
